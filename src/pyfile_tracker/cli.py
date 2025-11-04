@@ -56,9 +56,7 @@ class FileTrackerApp:
             "-k",
             "--keep",
             help=(
-                "Retention for tracking mode (continuous). "
-                "Format: integer N or timeframe like '30m', '1h', '1d'. "
-                "Currently used only for validation/logging (no pruning)."
+                "Retention for tracking mode (continuous)."
             ),
         )
         p.add_argument(
