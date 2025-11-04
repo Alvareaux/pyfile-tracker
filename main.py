@@ -7,6 +7,8 @@ import sys
 import time
 import re
 import hashlib
+import tempfile
+import zipfile
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -34,7 +36,6 @@ def get_default_base_for_input(input_path: str) -> str:
     drive, _ = os.path.splitdrive(abs_input)
 
     if os.name == "nt" and drive:
-        # drive like 'D:' -> 'D:\\'
         root = drive + os.path.sep
         base = os.path.join(root, ".pyfile_tracker")
     else:
@@ -62,7 +63,7 @@ def load_metadata(version_root: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         return {
             "input_path": None,
-            "snapshots": []  # list of {id, timestamp, iso}
+            "snapshots": []  # list of {id, timestamp, iso, archive?}
         }
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -98,7 +99,7 @@ def ensure_version_root_not_in_input(input_path: str, version_root: str) -> None
     try:
         common = os.path.commonpath([abs_in, vr])
     except ValueError:
-        # Different drives on Windows -> safe
+        # Different drives on Windows
         return
     if common == abs_in:
         raise SystemExit(
@@ -118,19 +119,6 @@ def next_snapshot_id(metadata: Dict[str, Any]) -> int:
     if not snaps:
         return 1
     return max(s["id"] for s in snaps) + 1
-
-
-def copy_tree(src_root: str, dst_root: str) -> None:
-    for dirpath, dirnames, filenames in os.walk(src_root):
-        rel_dir = os.path.relpath(dirpath, src_root)
-        if rel_dir == ".":
-            rel_dir = ""
-        target_dir = os.path.join(dst_root, rel_dir) if rel_dir else dst_root
-        os.makedirs(target_dir, exist_ok=True)
-        for name in filenames:
-            src_file = os.path.join(dirpath, name)
-            dst_file = os.path.join(target_dir, name)
-            shutil.copy2(src_file, dst_file)
 
 
 def parse_retention(k_value: str) -> Tuple[str, Any]:
@@ -186,14 +174,19 @@ def prune_snapshots(version_root: str, metadata: Dict[str, Any],
     else:
         raise ValueError("Unknown retention mode")
 
-    # Delete removed snapshots from disk
+    snaps_dir = os.path.join(version_root, SNAPSHOT_DIR)
+
+    # Delete removed snapshots from disk (zip OR legacy dir)
     for s in snaps:
         if s["id"] not in keep_ids:
-            snap_dir = os.path.join(
-                version_root, SNAPSHOT_DIR, f"snapshot_{s['id']:06d}"
-            )
-            if os.path.isdir(snap_dir):
-                shutil.rmtree(snap_dir, ignore_errors=True)
+            base = f"snapshot_{s['id']:06d}"
+            zip_path = os.path.join(snaps_dir, base + ".zip")
+            dir_path = os.path.join(snaps_dir, base)
+
+            if os.path.isfile(zip_path):
+                os.remove(zip_path)
+            if os.path.isdir(dir_path):
+                shutil.rmtree(dir_path, ignore_errors=True)
 
     metadata["snapshots"] = [s for s in snaps if s["id"] in keep_ids]
 
@@ -204,13 +197,22 @@ def create_snapshot(input_path: str, version_root: str,
     os.makedirs(snaps_dir, exist_ok=True)
 
     snap_id = next_snapshot_id(metadata)
-    snap_dir = os.path.join(snaps_dir, f"snapshot_{snap_id:06d}")
+    base_name = f"snapshot_{snap_id:06d}"
+    archive_base = os.path.join(snaps_dir, base_name)
+    archive_path = archive_base + ".zip"
 
-    if os.path.exists(snap_dir):
-        raise SystemExit(f"Snapshot directory already exists: {snap_dir}")
+    if os.path.exists(archive_path):
+        raise SystemExit(f"Snapshot archive already exists: {archive_path}")
 
     abs_input = os.path.abspath(os.path.expanduser(input_path))
-    copy_tree(abs_input, snap_dir)
+
+    # Create ZIP snapshot, with relative paths inside
+    shutil.make_archive(
+        archive_base,
+        "zip",
+        root_dir=abs_input,
+        base_dir="."
+    )
 
     ts = time.time()
     iso = datetime.fromtimestamp(ts).isoformat(timespec="seconds")
@@ -218,6 +220,7 @@ def create_snapshot(input_path: str, version_root: str,
         "id": snap_id,
         "timestamp": ts,
         "iso": iso,
+        "archive": os.path.basename(archive_path),
     }
     metadata.setdefault("snapshots", []).append(snap_meta)
     return snap_meta
@@ -297,13 +300,30 @@ def restore_snapshot(input_path: str, version_root: str,
     ensure_version_root_not_in_input(abs_input, version_root)
 
     snaps_dir = os.path.join(version_root, SNAPSHOT_DIR)
-    snap_dir = os.path.join(snaps_dir, f"snapshot_{snapshot['id']:06d}")
-    if not os.path.isdir(snap_dir):
-        raise SystemExit(f"Snapshot directory not found: {snap_dir}")
+    base = f"snapshot_{snapshot['id']:06d}"
+    zip_path = os.path.join(snaps_dir, base + ".zip")
+    legacy_dir = os.path.join(snaps_dir, base)
 
-    # Build relative file sets
+    # Prepare snapshot contents directory (from ZIP or legacy dir)
+    if os.path.isfile(zip_path):
+        tmp_dir = tempfile.mkdtemp(prefix=f"restore_{snapshot['id']:06d}_", dir=version_root)
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(tmp_dir)
+            snap_root = tmp_dir
+            _do_restore_from_root(abs_input, snap_root)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    elif os.path.isdir(legacy_dir):
+        snap_root = legacy_dir
+        _do_restore_from_root(abs_input, snap_root)
+    else:
+        raise SystemExit(f"Snapshot data not found for id={snapshot['id']}.")
+
+
+def _do_restore_from_root(abs_input: str, snap_root: str) -> None:
     current_files = build_rel_paths(abs_input)
-    snap_files = build_rel_paths(snap_dir)
+    snap_files = build_rel_paths(snap_root)
 
     # Delete files not present in snapshot
     to_delete = current_files - snap_files
@@ -314,7 +334,7 @@ def restore_snapshot(input_path: str, version_root: str,
 
     # Restore snapshot files
     for rel in snap_files:
-        src = os.path.join(snap_dir, rel)
+        src = os.path.join(snap_root, rel)
         dst = os.path.join(abs_input, rel)
         dst_dir = os.path.dirname(dst)
         os.makedirs(dst_dir, exist_ok=True)
@@ -332,7 +352,6 @@ class ChangeHandler(FileSystemEventHandler):
         if not path:
             return
         abs_path = os.path.abspath(path)
-        # Ensure it's under the input root; handle cross-drive safely
         try:
             inside = os.path.commonpath([abs_path, self.input_root]) == self.input_root
         except ValueError:
@@ -363,7 +382,7 @@ def run_tracking(input_path: str, version_root: str, keep_value: str, interval: 
 
     mode, param = parse_retention(keep_value)
 
-    # Optional: ensure we have at least one baseline snapshot
+    # Baseline snapshot if none exist
     if not metadata.get("snapshots"):
         snap = create_snapshot(input_path, version_root, metadata)
         prune_snapshots(version_root, metadata, mode, param)
