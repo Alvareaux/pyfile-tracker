@@ -8,16 +8,15 @@ import time
 import re
 import hashlib
 import tempfile
-import zipfile
+import subprocess
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-
 METADATA_FILE = "metadata.json"
-SNAPSHOT_DIR = "snapshots"
+GIT_DIR_NAME = "repo.git"
 DEBOUNCE_SECONDS = 2.0  # wait this long after last change before snapshot
 
 
@@ -58,12 +57,35 @@ def get_version_root(input_path: str, output_path: Optional[str]) -> str:
     return root
 
 
+def run_git(git_dir: str, work_tree: str, args: List[str],
+           check: bool = True, capture_output: bool = False) -> subprocess.CompletedProcess:
+    cmd = ["git", f"--git-dir={git_dir}", f"--work-tree={work_tree}"] + args
+    debug(" ".join(cmd))
+    result = subprocess.run(
+        cmd,
+        capture_output=capture_output,
+        text=True,
+    )
+    if check and result.returncode != 0:
+        raise SystemExit(f"Git command failed: {' '.join(cmd)}\n{result.stderr}")
+    return result
+
+
+def ensure_git_repo(git_dir: str, work_tree: str) -> None:
+    if not os.path.isdir(git_dir) or not os.path.isfile(os.path.join(git_dir, "HEAD")):
+        os.makedirs(git_dir, exist_ok=True)
+        run_git(git_dir, work_tree, ["init"])
+        # Set a default identity for commits
+        run_git(git_dir, work_tree, ["config", "user.name", "file-tracker"])
+        run_git(git_dir, work_tree, ["config", "user.email", "file-tracker@local"])
+
+
 def load_metadata(version_root: str) -> Dict[str, Any]:
     path = os.path.join(version_root, METADATA_FILE)
     if not os.path.exists(path):
         return {
             "input_path": None,
-            "snapshots": []  # list of {id, timestamp, iso, archive?}
+            "snapshots": []  # list of {id, timestamp, iso, commit}
         }
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -156,8 +178,11 @@ def parse_retention(k_value: str) -> Tuple[str, Any]:
     return "time", seconds
 
 
-def prune_snapshots(version_root: str, metadata: Dict[str, Any],
-                    mode: str, param: Any) -> None:
+def prune_snapshots(metadata: Dict[str, Any], mode: str, param: Any) -> None:
+    """
+    Logical retention: we trim the metadata list of snapshots.
+    Git still keeps older commits (efficiently packed).
+    """
     snaps = list_snapshots(metadata)
     now_ts = time.time()
 
@@ -174,53 +199,41 @@ def prune_snapshots(version_root: str, metadata: Dict[str, Any],
     else:
         raise ValueError("Unknown retention mode")
 
-    snaps_dir = os.path.join(version_root, SNAPSHOT_DIR)
-
-    # Delete removed snapshots from disk (zip OR legacy dir)
-    for s in snaps:
-        if s["id"] not in keep_ids:
-            base = f"snapshot_{s['id']:06d}"
-            zip_path = os.path.join(snaps_dir, base + ".zip")
-            dir_path = os.path.join(snaps_dir, base)
-
-            if os.path.isfile(zip_path):
-                os.remove(zip_path)
-            if os.path.isdir(dir_path):
-                shutil.rmtree(dir_path, ignore_errors=True)
-
     metadata["snapshots"] = [s for s in snaps if s["id"] in keep_ids]
 
 
 def create_snapshot(input_path: str, version_root: str,
-                    metadata: Dict[str, Any]) -> Dict[str, Any]:
-    snaps_dir = os.path.join(version_root, SNAPSHOT_DIR)
-    os.makedirs(snaps_dir, exist_ok=True)
+                    metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    abs_input = os.path.abspath(os.path.expanduser(input_path))
+    git_dir = os.path.join(version_root, GIT_DIR_NAME)
+
+    ensure_git_repo(git_dir, abs_input)
+
+    # Stage everything
+    run_git(git_dir, abs_input, ["add", "-A"])
+
+    # Check if anything changed
+    diff_res = run_git(git_dir, abs_input, ["diff", "--cached", "--quiet"], check=False)
+    if diff_res.returncode == 0:
+        # No changes to commit
+        debug("No changes detected; skipping snapshot.")
+        return None
 
     snap_id = next_snapshot_id(metadata)
-    base_name = f"snapshot_{snap_id:06d}"
-    archive_base = os.path.join(snaps_dir, base_name)
-    archive_path = archive_base + ".zip"
-
-    if os.path.exists(archive_path):
-        raise SystemExit(f"Snapshot archive already exists: {archive_path}")
-
-    abs_input = os.path.abspath(os.path.expanduser(input_path))
-
-    # Create ZIP snapshot, with relative paths inside
-    shutil.make_archive(
-        archive_base,
-        "zip",
-        root_dir=abs_input,
-        base_dir="."
-    )
-
     ts = time.time()
     iso = datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+    msg = f"snapshot {snap_id} {iso}"
+
+    run_git(git_dir, abs_input, ["commit", "-m", msg])
+    commit = run_git(
+        git_dir, abs_input, ["rev-parse", "HEAD"], capture_output=True
+    ).stdout.strip()
+
     snap_meta = {
         "id": snap_id,
         "timestamp": ts,
         "iso": iso,
-        "archive": os.path.basename(archive_path),
+        "commit": commit,
     }
     metadata.setdefault("snapshots", []).append(snap_meta)
     return snap_meta
@@ -294,33 +307,6 @@ def build_rel_paths(root: str) -> set:
     return paths
 
 
-def restore_snapshot(input_path: str, version_root: str,
-                     snapshot: Dict[str, Any]) -> None:
-    abs_input = os.path.abspath(os.path.expanduser(input_path))
-    ensure_version_root_not_in_input(abs_input, version_root)
-
-    snaps_dir = os.path.join(version_root, SNAPSHOT_DIR)
-    base = f"snapshot_{snapshot['id']:06d}"
-    zip_path = os.path.join(snaps_dir, base + ".zip")
-    legacy_dir = os.path.join(snaps_dir, base)
-
-    # Prepare snapshot contents directory (from ZIP or legacy dir)
-    if os.path.isfile(zip_path):
-        tmp_dir = tempfile.mkdtemp(prefix=f"restore_{snapshot['id']:06d}_", dir=version_root)
-        try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(tmp_dir)
-            snap_root = tmp_dir
-            _do_restore_from_root(abs_input, snap_root)
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-    elif os.path.isdir(legacy_dir):
-        snap_root = legacy_dir
-        _do_restore_from_root(abs_input, snap_root)
-    else:
-        raise SystemExit(f"Snapshot data not found for id={snapshot['id']}.")
-
-
 def _do_restore_from_root(abs_input: str, snap_root: str) -> None:
     current_files = build_rel_paths(abs_input)
     snap_files = build_rel_paths(snap_root)
@@ -339,6 +325,25 @@ def _do_restore_from_root(abs_input: str, snap_root: str) -> None:
         dst_dir = os.path.dirname(dst)
         os.makedirs(dst_dir, exist_ok=True)
         shutil.copy2(src, dst)
+
+
+def restore_snapshot(input_path: str, version_root: str,
+                     snapshot: Dict[str, Any]) -> None:
+    abs_input = os.path.abspath(os.path.expanduser(input_path))
+    ensure_version_root_not_in_input(abs_input, version_root)
+
+    git_dir = os.path.join(version_root, GIT_DIR_NAME)
+    commit = snapshot.get("commit")
+    if not commit:
+        raise SystemExit("Snapshot metadata has no commit hash; old format not supported here.")
+
+    tmp_dir = tempfile.mkdtemp(prefix=f"restore_{snapshot['id']:06d}_", dir=version_root)
+    try:
+        # Materialize commit into temporary work-tree
+        run_git(git_dir, tmp_dir, ["checkout", commit, "--", "."])
+        _do_restore_from_root(abs_input, tmp_dir)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 class ChangeHandler(FileSystemEventHandler):
@@ -370,7 +375,7 @@ class ChangeHandler(FileSystemEventHandler):
             self._mark_change(getattr(event, "dest_path", None))
 
 
-def run_tracking(input_path: str, version_root: str, keep_value: str, interval: float) -> None:
+def run_tracking(input_path: str, version_root: str, keep_value: str) -> None:
     abs_input = os.path.abspath(os.path.expanduser(input_path))
     if not os.path.isdir(abs_input):
         raise SystemExit(f"Input path must be an existing directory: {input_path}")
@@ -385,9 +390,10 @@ def run_tracking(input_path: str, version_root: str, keep_value: str, interval: 
     # Baseline snapshot if none exist
     if not metadata.get("snapshots"):
         snap = create_snapshot(input_path, version_root, metadata)
-        prune_snapshots(version_root, metadata, mode, param)
-        save_metadata(version_root, metadata)
-        print(f"[init] Created baseline snapshot id={snap['id']} at {snap['iso']}")
+        if snap:
+            prune_snapshots(metadata, mode, param)
+            save_metadata(version_root, metadata)
+            print(f"[init] Created baseline snapshot id={snap['id']} at {snap['iso']}")
 
     handler = ChangeHandler(abs_input)
     observer = Observer()
@@ -400,16 +406,17 @@ def run_tracking(input_path: str, version_root: str, keep_value: str, interval: 
 
     try:
         while True:
-            time.sleep(interval)
+            time.sleep(0.5)
             if handler.pending and (time.time() - handler.last_change) >= DEBOUNCE_SECONDS:
                 handler.pending = False
                 snap = create_snapshot(input_path, version_root, metadata)
-                prune_snapshots(version_root, metadata, mode, param)
-                save_metadata(version_root, metadata)
-                print(
-                    f"[snapshot] id={snap['id']} at {snap['iso']} "
-                    f"(total kept: {len(metadata.get('snapshots', []))})"
-                )
+                if snap:
+                    prune_snapshots(metadata, mode, param)
+                    save_metadata(version_root, metadata)
+                    print(
+                        f"[snapshot] id={snap['id']} at {snap['iso']} "
+                        f"(total kept: {len(metadata.get('snapshots', []))})"
+                    )
     except KeyboardInterrupt:
         print("\nStopping tracking...")
     finally:
@@ -419,7 +426,7 @@ def run_tracking(input_path: str, version_root: str, keep_value: str, interval: 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Continuous file versioning tool for a folder."
+        description="Continuous incremental file versioning tool for a folder (git-based)."
     )
     p.add_argument(
         "-i",
@@ -448,13 +455,6 @@ def parse_args() -> argparse.Namespace:
             "(0=last, 1=previous, -1=earliest, ...) or Unix timestamp or ISO datetime."
         ),
     )
-    p.add_argument(
-        "-p",
-        "--polling-interval",
-        type=float,
-        default=1.0,
-        help="Polling interval in seconds (default: 1.0).",
-    )
     args = p.parse_args()
 
     if bool(args.keep) == bool(args.recover):
@@ -464,16 +464,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    if shutil.which("git") is None:
+        raise SystemExit("git is required but not found on PATH.")
+
     args = parse_args()
 
     input_path = args.input
     version_root = get_version_root(input_path, args.output)
 
     if args.keep:
-        # Continuous tracking mode
-        run_tracking(input_path, version_root, args.keep, args.polling_interval)
+        run_tracking(input_path, version_root, args.keep)
     else:
-        # One-shot recovery mode
         metadata = load_metadata(version_root)
         ensure_input_path(metadata, input_path)
         snap = parse_recover_point(args.recover, metadata)
