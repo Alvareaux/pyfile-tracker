@@ -375,7 +375,7 @@ class ChangeHandler(FileSystemEventHandler):
             self._mark_change(getattr(event, "dest_path", None))
 
 
-def run_tracking(input_path: str, version_root: str, keep_value: str) -> None:
+def run_tracking(input_path: str, version_root: str, keep_value: str, polling_interval: float) -> None:
     abs_input = os.path.abspath(os.path.expanduser(input_path))
     if not os.path.isdir(abs_input):
         raise SystemExit(f"Input path must be an existing directory: {input_path}")
@@ -406,7 +406,7 @@ def run_tracking(input_path: str, version_root: str, keep_value: str) -> None:
 
     try:
         while True:
-            time.sleep(0.5)
+            time.sleep(polling_interval)
             if handler.pending and (time.time() - handler.last_change) >= DEBOUNCE_SECONDS:
                 handler.pending = False
                 snap = create_snapshot(input_path, version_root, metadata)
@@ -454,6 +454,13 @@ def parse_args() -> argparse.Namespace:
             "Recovery mode (one-shot): recover point, either integer revision index "
             "(0=last, 1=previous, -1=earliest, ...) or Unix timestamp or ISO datetime."
         ),
+    )
+    p.add_argument(
+        "-p",
+        "--polling-interval",
+        type=float,
+        default=60.0,
+        help="Polling interval in seconds (default: 60.0 seconds).",
     )
     args = p.parse_args()
 
