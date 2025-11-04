@@ -9,7 +9,7 @@ import tempfile
 import subprocess
 import logging
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -53,13 +53,19 @@ class FileTrackerApp:
             help="Version store path. Defaults to per-drive app directory based on input path.",
         )
         p.add_argument(
-            "-k",
-            "--keep",
+            "-t",
+            "--track",
+            action='store_true',
             help=(
                 "Retention for tracking mode (continuous). "
-                "Format: integer N or timeframe like '30m', '1h', '1d'. "
-                "Currently used only for validation/logging (no pruning)."
             ),
+        )
+        p.add_argument(
+            "-p",
+            "--polling-interval",
+            type=float,
+            default=60.0,
+            help="Polling interval in seconds (default: 60.0 seconds).",
         )
         p.add_argument(
             "-r",
@@ -79,9 +85,9 @@ class FileTrackerApp:
         )
         args = p.parse_args()
 
-        if bool(args.keep) == bool(args.recover):
+        if bool(args.track) == bool(args.recover):
             p.error(
-                "Exactly one of -k/--keep (tracking) or -r/--recover (recovery) must be provided."
+                "Exactly one of -k/--track (tracking) or -r/--recover (recovery) must be provided."
             )
 
         return args
@@ -208,38 +214,6 @@ class FileTrackerApp:
         if not snaps:
             return 1
         return max(s["id"] for s in snaps) + 1
-
-    def parse_retention(self, k_value: str) -> Tuple[str, Any]:
-        """
-        Still parses/validates -k, but result is only logged, not used for pruning.
-        """
-        k_value = k_value.strip()
-        try:
-            n = int(k_value)
-            if n <= 0:
-                raise ValueError("N must be positive")
-            return "count", n
-        except ValueError:
-            pass
-
-        m = re.fullmatch(r"(\d+)\s*([smhd])", k_value, re.IGNORECASE)
-        if not m:
-            raise SystemExit(
-                f"Invalid -k value '{k_value}'. Use integer N or timeframe like '30m', '1h', '1d'."
-            )
-        amount = int(m.group(1))
-        unit = m.group(2).lower()
-        if unit == "s":
-            seconds = amount
-        elif unit == "m":
-            seconds = amount * 60
-        elif unit == "h":
-            seconds = amount * 3600
-        elif unit == "d":
-            seconds = amount * 86400
-        else:
-            raise SystemExit(f"Unsupported timeframe unit: {unit}")
-        return "time", seconds
 
     def create_snapshot(self) -> Optional[Dict[str, Any]]:
         abs_input = os.path.abspath(os.path.expanduser(self.input_path))
@@ -441,8 +415,6 @@ class FileTrackerApp:
 
         self.ensure_version_root_not_in_input()
 
-        mode, param = self.parse_retention(self.args.keep)
-
         if not self.metadata.get("snapshots"):
             snap = self.create_snapshot()
             if snap:
@@ -460,12 +432,6 @@ class FileTrackerApp:
 
         self.logger.info("Tracking '%s'", abs_input)
         self.logger.info("Version store: %s", self.version_root)
-        self.logger.info(
-            "Retention (no pruning): mode=%s, param=%s, raw='%s'",
-            mode,
-            param,
-            self.args.keep,
-        )
 
         try:
             while True:
@@ -504,7 +470,7 @@ class FileTrackerApp:
     # ---------- Entry ----------
 
     def run(self) -> None:
-        if self.args.keep:
+        if self.args.track:
             self.run_tracking()
         else:
             self.run_recovery()
