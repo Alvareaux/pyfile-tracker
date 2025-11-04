@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyfile-tracker"
+version = "0.1.0"
+description = "Continuous incremental file versioning tool for folders (git-based)."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+  { name = "Anatolii V." }
+]
+dependencies = [
+  "watchdog>=3.0.0",
+]
+
+[project.scripts]
+file-tracker = "file_tracker.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
