@@ -56,8 +56,9 @@ class FileTrackerApp:
             "-k",
             "--keep",
             help=(
-                "Retention for tracking mode (continuous): integer N (keep last N snapshots) "
-                "or timeframe like '30m', '1h', '1d'."
+                "Retention for tracking mode (continuous). "
+                "Format: integer N or timeframe like '30m', '1h', '1d'. "
+                "Currently used only for validation/logging (no pruning)."
             ),
         )
         p.add_argument(
@@ -240,25 +241,6 @@ class FileTrackerApp:
         else:
             raise SystemExit(f"Unsupported timeframe unit: {unit}")
         return "time", seconds
-
-    def prune_snapshots(self, mode: str, param: Any) -> None:
-        snaps = self.list_snapshots()
-        now_ts = time.time()
-
-        keep_ids = set()
-        if mode == "count":
-            n = param
-            snaps_to_keep = snaps[-n:] if n < len(snaps) else snaps
-            keep_ids = {s["id"] for s in snaps_to_keep}
-        elif mode == "time":
-            seconds = param
-            cutoff = now_ts - seconds
-            snaps_to_keep = [s for s in snaps if s["timestamp"] >= cutoff]
-            keep_ids = {s["id"] for s in snaps_to_keep}
-        else:
-            raise ValueError("Unknown retention mode")
-
-        self.metadata["snapshots"] = [s for s in snaps if s["id"] in keep_ids]
 
     def create_snapshot(self) -> Optional[Dict[str, Any]]:
         abs_input = os.path.abspath(os.path.expanduser(self.input_path))
@@ -445,7 +427,6 @@ class FileTrackerApp:
         if not self.metadata.get("snapshots"):
             snap = self.create_snapshot()
             if snap:
-                self.prune_snapshots(mode, param)
                 self.save_metadata()
                 self.logger.info(
                     "[init] Created baseline snapshot id=%s at %s",
@@ -461,7 +442,10 @@ class FileTrackerApp:
         self.logger.info("Tracking '%s'", abs_input)
         self.logger.info("Version store: %s", self.version_root)
         self.logger.info(
-            "Retention: mode=%s, param=%s  (use Ctrl+C to stop)", mode, param
+            "Retention (no pruning): mode=%s, param=%s, raw='%s'",
+            mode,
+            param,
+            self.args.keep,
         )
 
         try:
@@ -474,10 +458,9 @@ class FileTrackerApp:
                     handler.pending = False
                     snap = self.create_snapshot()
                     if snap:
-                        self.prune_snapshots(mode, param)
                         self.save_metadata()
                         self.logger.info(
-                            "[snapshot] id=%s at %s (total kept: %s)",
+                            "[snapshot] id=%s at %s (total recorded: %s)",
                             snap["id"],
                             snap["iso"],
                             len(self.metadata.get("snapshots", [])),
