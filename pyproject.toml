@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-file-tracker = "file_tracker.cli:main"
+pyfile-tracker = "pyfile_tracker.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
