@@ -56,23 +56,21 @@ class FileTrackerApp:
             "-k",
             "--keep",
             help=(
-                "Retention for tracking mode (continuous)."
+                "Retention for tracking mode (continuous). "
+                "Format: integer N or timeframe like '30m', '1h', '1d'. "
+                "Currently used only for validation/logging (no pruning)."
             ),
         )
         p.add_argument(
             "-r",
             "--recover",
             help=(
-                "Recovery mode (one-shot): recover point, either integer revision index "
-                "(0=last, 1=previous, -1=earliest, ...) or Unix timestamp or ISO datetime."
+                "Recovery mode (one-shot): recover point, either:\n"
+                "  * integer revision index (0=last, 1=previous, -1=earliest, ...), or\n"
+                "  * Unix timestamp, or\n"
+                "  * ISO datetime (YYYY-MM-DDTHH:MM:SS), or\n"
+                "  * timedelta like '30m', '1h', '1d' (relative to now)."
             ),
-        )
-        p.add_argument(
-            "-p",
-            "--polling-interval",
-            type=float,
-            default=60.0,
-            help="Polling interval in seconds (default: 60.0 seconds).",
         )
         p.add_argument(
             "--log-level",
@@ -212,6 +210,9 @@ class FileTrackerApp:
         return max(s["id"] for s in snaps) + 1
 
     def parse_retention(self, k_value: str) -> Tuple[str, Any]:
+        """
+        Still parses/validates -k, but result is only logged, not used for pruning.
+        """
         k_value = k_value.strip()
         try:
             n = int(k_value)
@@ -279,6 +280,7 @@ class FileTrackerApp:
         if not snaps:
             raise SystemExit("No snapshots available to recover from.")
 
+        # 1) integer index
         try:
             idx = int(r_value)
             n = len(snaps)
@@ -294,24 +296,43 @@ class FileTrackerApp:
         except ValueError:
             pass
 
-        if re.fullmatch(r"\d+(\.\d+)?", r_value):
-            try:
-                ts = float(r_value)
-            except ValueError:
-                raise SystemExit(f"Invalid timestamp '{r_value}'.")
+        # 2) timedelta-like string: "30m", "1h", "2d", "45s"
+        m = re.fullmatch(r"(\d+)\s*([smhd])", r_value.strip(), re.IGNORECASE)
+        if m:
+            amount = int(m.group(1))
+            unit = m.group(2).lower()
+            if unit == "s":
+                seconds = amount
+            elif unit == "m":
+                seconds = amount * 60
+            elif unit == "h":
+                seconds = amount * 3600
+            elif unit == "d":
+                seconds = amount * 86400
+            else:
+                raise SystemExit(f"Unsupported timedelta unit in -r: {unit}")
+            ts = time.time() - seconds
         else:
-            s = r_value.strip()
-            if " " in s and "T" not in s:
-                s = s.replace(" ", "T")
-            try:
-                dt = datetime.fromisoformat(s)
-            except ValueError:
-                raise SystemExit(
-                    f"Invalid recover point '{r_value}'. "
-                    "Use int index, Unix timestamp, or ISO datetime (YYYY-MM-DDTHH:MM:SS)."
-                )
-            ts = dt.timestamp()
+            # 3) numeric timestamp or ISO datetime
+            if re.fullmatch(r"\d+(\.\d+)?", r_value):
+                try:
+                    ts = float(r_value)
+                except ValueError:
+                    raise SystemExit(f"Invalid timestamp '{r_value}'.")
+            else:
+                s = r_value.strip()
+                if " " in s and "T" not in s:
+                    s = s.replace(" ", "T")
+                try:
+                    dt = datetime.fromisoformat(s)
+                except ValueError:
+                    raise SystemExit(
+                        f"Invalid recover point '{r_value}'. "
+                        "Use int index, Unix timestamp, ISO datetime, or timedelta like '1h'."
+                    )
+                ts = dt.timestamp()
 
+        # common path for (2) and (3): find snapshot <= ts, latest
         candidate = None
         for s in snaps:
             if s["timestamp"] <= ts:
@@ -320,7 +341,7 @@ class FileTrackerApp:
                 break
         if candidate is None:
             raise SystemExit(
-                f"No snapshot found at or before timestamp {r_value} "
+                f"No snapshot found at or before target time "
                 f"({datetime.fromtimestamp(ts).isoformat(timespec='seconds')})."
             )
         return candidate
